@@ -1,0 +1,100 @@
+--- a/src/backend/drm/impl/Atomic.cpp
++++ b/src/backend/drm/impl/Atomic.cpp
+@@ -6,6 +6,10 @@
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ #include <sys/mman.h>
++#include <fcntl.h>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
+ #include <sstream>
+ #include <optional>
+ #include "Shared.hpp"
+@@ -501,6 +505,36 @@
+         connector->crtc->atomic.ctmStateKnown = true;
+ }
+ 
++
++namespace {
++bool aqDamageTraceEnabled() {
++    static const bool ENABLED = [] {
++        const char* env = std::getenv("AQ_DAMAGE_TRACE");
++        return env && env[0] == '1' && env[1] == '\0';
++    }();
++    return ENABLED;
++}
++
++void aqDamageTraceLine(const char* line) {
++    if (!aqDamageTraceEnabled() || !line)
++        return;
++
++    static FILE* fp = []() -> FILE* {
++        const int fd = ::open("/tmp/aq-damage-trace.log", O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
++        return fd < 0 ? nullptr : ::fdopen(fd, "a");
++    }();
++    static unsigned lines = 0;
++    if (!fp || lines >= 8000)
++        return;
++
++    timespec ts{};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    std::fprintf(fp, "%lld.%09ld %s\n", static_cast<long long>(ts.tv_sec), ts.tv_nsec, line);
++    std::fflush(fp);
++    ++lines;
++}
++}
++
+ bool Aquamarine::CDRMAtomicImpl::prepareConnector(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {
+     const auto& STATE  = data.outputState;
+     const bool  enable = data.enabled;
+@@ -608,16 +642,39 @@
+     }
+ 
+     if ((data.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE) && connector->crtc->primary->props.values.fb_damage_clips && MODE) {
+-        if (data.damage.empty())
++        if (data.damage.empty()) {
++            if (aqDamageTraceEnabled()) {
++                char       line[384];
++                const auto fb = data.mainFB ? data.mainFB->id : 0;
++                std::snprintf(line, sizeof(line), "fb=%u test=%d modeset=%d committed=0x%x damage=empty", fb, data.test ? 1 : 0, data.modeset ? 1 : 0, data.committed);
++                aqDamageTraceLine(line);
++            }
+             data.atomic.fbDamage = 0;
+-        else {
++        } else {
+             TRACE(connector->backend->backend->log(AQ_LOG_TRACE, std::format("atomic drm: clipping damage to pixel size {}", MODE->pixelSize)));
+             std::vector<pixman_box32_t> rects = data.damage.copy().intersect(CBox{{}, MODE->pixelSize}).getRects();
++            if (aqDamageTraceEnabled()) {
++                char       line[384];
++                const auto fb = data.mainFB ? data.mainFB->id : 0;
++                int        n  = std::snprintf(line, sizeof(line), "fb=%u test=%d modeset=%d committed=0x%x damage=rects:%zu pixel:%.0fx%.0f", fb, data.test ? 1 : 0,
++                                              data.modeset ? 1 : 0, data.committed, rects.size(), MODE->pixelSize.x, MODE->pixelSize.y);
++                for (size_t i = 0; i < rects.size() && i < 4 && n > 0 && n < static_cast<int>(sizeof(line)); ++i)
++                    n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), " r%zu:%d,%d,%d,%d", i, rects[i].x1, rects[i].y1, rects[i].x2, rects[i].y2);
++                if (rects.size() > 4 && n > 0 && n < static_cast<int>(sizeof(line)))
++                    std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), " more=%zu", rects.size() - 4);
++                aqDamageTraceLine(line);
++            }
+             if (drmModeCreatePropertyBlob(connector->backend->gpu->fd, rects.data(), sizeof(pixman_box32_t) * rects.size(), &data.atomic.fbDamage)) {
+                 connector->backend->backend->log(AQ_LOG_ERROR, "atomic drm: failed to create a damage blob");
+                 return false;
+             }
+         }
++    } else if (aqDamageTraceEnabled()) {
++        char        line[384];
++        const auto  fb  = data.mainFB ? data.mainFB->id : 0;
++        const char* why = (data.committed & COutputState::AQ_OUTPUT_STATE_DAMAGE) ? "damage-bit-not-recorded" : "damage-bit-unset";
++        std::snprintf(line, sizeof(line), "fb=%u test=%d modeset=%d committed=0x%x %s", fb, data.test ? 1 : 0, data.modeset ? 1 : 0, data.committed, why);
++        aqDamageTraceLine(line);
+     }
+ 
+     return true;
+@@ -764,6 +821,7 @@
+         return true;
+ 
+     if (!skipSchedule) {
++        aqDamageTraceLine("moveCursor schedule");
+         TRACE(connector->backend->log(AQ_LOG_TRACE, "atomic moveCursor"));
+         connector->output->scheduleFrame(IOutput::AQ_SCHEDULE_CURSOR_MOVE);
+     }
